@@ -18,7 +18,8 @@ means correctness is judged by an independent tool rather than by my own tests.
 
 - [x] RESP request parsing — length-prefixed framing that survives a command
       split across any number of TCP packets, verified byte-at-a-time in tests
-- [ ] RESP reply encoding
+- [x] RESP reply encoding — including the null/empty-string distinction that
+      lets a cache tell a miss from a stored empty value
 - [ ] `PING`, `ECHO`, `SET`, `GET`
 - [ ] Concurrent client handling
 - [ ] Key expiry (`EX` / `PX`)

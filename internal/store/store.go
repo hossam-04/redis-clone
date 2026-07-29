@@ -46,6 +46,16 @@ type Store struct {
 	mu sync.RWMutex
 	m  map[string]entry
 
+	// volatile indexes exactly the keys that carry a deadline. The sweeper
+	// samples from here rather than from m.
+	//
+	// Without it, sampling is useless at realistic ratios: a cache with a
+	// million keys of which ten thousand have TTLs would spend roughly 199
+	// samples in 200 looking at keys that can never expire. The deadline
+	// itself stays in the entry so Get still needs only one lookup -- this
+	// holds no timestamps, only names.
+	volatile map[string]struct{}
+
 	// now is swappable so tests can control the passage of time instead of
 	// sleeping. Same idea as the parser taking an io.Reader rather than a
 	// net.Conn: depend on the capability, not the concrete thing, and the
@@ -56,8 +66,9 @@ type Store struct {
 // New returns an empty Store ready for concurrent use.
 func New() *Store {
 	return &Store{
-		m:   make(map[string]entry),
-		now: time.Now,
+		m:        make(map[string]entry),
+		volatile: make(map[string]struct{}),
+		now:      time.Now,
 	}
 }
 
@@ -97,13 +108,23 @@ func (s *Store) Get(key string) (string, bool) {
 		// Someone else deleted it, or the sweeper got there first.
 		return "", false
 	case e.expired(s.now()):
-		delete(s.m, key)
+		s.remove(key)
 		return "", false
 	default:
 		// Replaced with a fresh value during the gap. It is not ours to
 		// delete, and the client asking now deserves the current value.
 		return e.value, true
 	}
+}
+
+// remove deletes a key from both the map and the volatile index. Callers must
+// already hold the write lock.
+//
+// Both deletions always happen together: an entry in volatile with no entry in
+// m would be a slot the sweeper wastes a sample on forever.
+func (s *Store) remove(key string) {
+	delete(s.m, key)
+	delete(s.volatile, key)
 }
 
 // Set stores value under key with no expiry, discarding any TTL the key
@@ -121,4 +142,91 @@ func (s *Store) put(key string, e entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.m[key] = e
+	// Keep the index honest in both directions. A plain SET over a key that
+	// had a TTL must drop it out of volatile, or the sweeper keeps sampling a
+	// key that can no longer expire.
+	if e.expiresAt.IsZero() {
+		delete(s.volatile, key)
+	} else {
+		s.volatile[key] = struct{}{}
+	}
+}
+
+// Tuning for the sweeper. These mirror real Redis, which samples 20 keys per
+// cycle and goes around again while more than a quarter turn out to be
+// expired.
+const (
+	// sweepSample is how many volatile keys one round inspects. Small enough
+	// that the write lock is held for microseconds.
+	sweepSample = 20
+	// sweepRepeatRatio is the expired fraction above which a round repeats
+	// immediately instead of waiting for the next tick.
+	sweepRepeatRatio = 0.25
+	// sweepMaxRounds caps a single sweep. Without it, a keyspace that is
+	// mostly expired would keep clearing the threshold and hold the lock for
+	// an unbounded stretch -- the server-wide stall that active-only expiry
+	// is supposed to avoid.
+	sweepMaxRounds = 16
+)
+
+// SweepExpired removes expired keys that nobody has asked for, and reports how
+// many it deleted. This is the active half of expiry; Get is the lazy half.
+//
+// Neither half is sufficient alone. Lazy-only leaks: a key written with a TTL
+// and never read again is never noticed, so a session cache whose users do not
+// return grows without bound. Active-only cannot afford to be exhaustive:
+// scanning ten million keys means holding the write lock across all of them,
+// stalling every client in the server.
+//
+// So this is deliberately probabilistic. It never looks at the whole keyspace,
+// only a sample, and repeats while the sample keeps coming back mostly
+// expired. That bounds the expired-but-resident population without ever
+// promising to eliminate it -- affordable, rather than complete.
+//
+// The caller decides how often to run it; the Store owns no goroutines.
+func (s *Store) SweepExpired() int {
+	deleted := 0
+	for range sweepMaxRounds {
+		sampled, removed := s.sweepRound()
+		deleted += removed
+		// Stop when the sample comes back mostly live, or when there was
+		// nothing volatile left to look at.
+		if sampled == 0 || float64(removed)/float64(sampled) <= sweepRepeatRatio {
+			break
+		}
+	}
+	return deleted
+}
+
+// sweepRound inspects up to sweepSample volatile keys and deletes the expired
+// ones, holding the write lock for exactly one round.
+func (s *Store) sweepRound() (sampled, removed int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	// Go randomizes both the starting bucket and the offset within it on every
+	// range, so successive rounds look at different keys. That is a randomized
+	// start rather than a uniform random sample -- weaker than what Redis gets
+	// from picking random dict entries, but it costs nothing and is fair
+	// enough for a population estimate.
+	for key := range s.volatile {
+		if sampled == sweepSample {
+			break
+		}
+		sampled++
+
+		e, ok := s.m[key]
+		if !ok {
+			// Indexed but absent: nothing to reclaim, so drop the stale name
+			// rather than sampling it again forever.
+			delete(s.volatile, key)
+			continue
+		}
+		if e.expired(now) {
+			s.remove(key)
+			removed++
+		}
+	}
+	return sampled, removed
 }

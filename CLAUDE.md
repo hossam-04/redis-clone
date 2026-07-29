@@ -29,6 +29,7 @@ I am a new CS grad. Claude writes the code; I must understand every decision.
   fixing it.
 - If I'm stuck, give escalating hints (nudge → narrow it down → answer).
   Do not jump to the answer.
+- Roughly weekly, inject a realistic bug and make me find it.
 - End each session: ask me to explain back what we built, then probe weak spots.
 
 ## Guardrails

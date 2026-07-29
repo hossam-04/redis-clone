@@ -127,6 +127,49 @@ func (s *Store) remove(key string) {
 	delete(s.volatile, key)
 }
 
+// Len reports how many entries are resident, counting any that have expired
+// but not yet been reclaimed.
+//
+// Counting the not-yet-reclaimed ones is what makes the sweeper observable
+// from outside: the number falls on its own, without anybody reading a key.
+// A count that hid them would be indistinguishable from lazy expiry.
+func (s *Store) Len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.m)
+}
+
+// TTL reports how long key has left before it expires.
+//
+// Three outcomes, because a client genuinely has to tell them apart:
+//
+//	exists == false     no such key (missing outright, or expired)
+//	hasTTL == false     the key is there and never expires
+//	otherwise           d is the time remaining
+//
+// Collapsing the first two would leave a caller unable to distinguish "this
+// key is permanent" from "this key is gone", which is the same mistake as
+// answering both a miss and a stored empty string with a null.
+//
+// Expired keys are reported gone but not deleted here. Reclaiming would mean
+// taking the write lock on every TTL call; Get and the sweeper both free it
+// soon enough.
+func (s *Store) TTL(key string) (d time.Duration, hasTTL, exists bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.m[key]
+	now := s.now()
+	switch {
+	case !ok || e.expired(now):
+		return 0, false, false
+	case e.expiresAt.IsZero():
+		return 0, false, true
+	default:
+		return e.expiresAt.Sub(now), true, true
+	}
+}
+
 // Set stores value under key with no expiry, discarding any TTL the key
 // previously had. That matches Redis: a plain SET clears an existing TTL.
 func (s *Store) Set(key, value string) {

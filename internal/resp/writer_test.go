@@ -61,6 +61,24 @@ func TestWriteReplies(t *testing.T) {
 			WriteNull,
 			"$-1\r\n",
 		},
+		{
+			"integer",
+			func(w *bufio.Writer) error { return WriteInteger(w, 42) },
+			":42\r\n",
+		},
+		{
+			// Negative integers are how commands smuggle extra meaning into
+			// an integer reply -- TTL's -1 and -2 -- so they must encode
+			// plainly rather than being treated as an error.
+			"negative integer",
+			func(w *bufio.Writer) error { return WriteInteger(w, -2) },
+			":-2\r\n",
+		},
+		{
+			"zero",
+			func(w *bufio.Writer) error { return WriteInteger(w, 0) },
+			":0\r\n",
+		},
 	}
 
 	for _, tt := range tests {

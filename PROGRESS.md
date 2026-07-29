@@ -6,10 +6,14 @@ code alone does not carry.
 ---
 
 ## Current state
-**Milestone 1 — done.** Real `redis-cli` connects and runs `PING`, `ECHO`,
-`SET`, and `GET` against this server unmodified. Read path, write path,
-dispatch, and a mutex-guarded store are all in place; 20 concurrent clients run
-clean under `-race`.
+**Milestone 2 — expiry done, eviction next.** Keys now expire two ways: on read
+(lazy) and via a bounded sampling sweeper on a 100ms tick (active). `SET k v EX
+10`, `PX`, and `TTL`'s three states all work against real `redis-cli`. Verified
+end to end: 200 keys with `EX 1` that nothing ever reads drop out of `DBSIZE`
+on their own within about a second.
+
+Milestone 1 delivered the listener, the RESP parser and encoder, dispatch, and
+the mutex-guarded store.
 
 - Go 1.26.5 (darwin/arm64)
 - redis-cli / redis-server 8.8.1 — the real tools, kept as the correctness oracle
@@ -28,15 +32,22 @@ clean under `-race`.
 | 4 | Benchmark with `redis-benchmark`, record throughput + p99, write the README. | ☐ |
 
 ## Next up
-Milestone 2: key expiry (`EX` / `PX`) and LRU eviction. First design question is
-whether expired keys are removed eagerly on a timer or lazily on access, and
-what that choice costs in memory versus CPU.
+LRU eviction, the second half of milestone 2. The design question: tracking
+true least-recently-used needs a per-key access order, and maintaining an exact
+one on every read means a write on every read — which would turn `Get` into a
+writer and destroy the point of the `RWMutex`. Redis approximates instead.
 
 ## Open questions
-- `SET` ignores `EX` / `PX` / `NX` / `XX` and rejects them as a wrong argument
-  count. Milestone 2 fixes this.
-- One `RWMutex` covers the whole map, so every writer in the server serialises.
-  Fine at current scale; revisit if benchmarks show lock contention.
+- `SET` still ignores `NX` / `XX` / `KEEPTTL`; only `EX` and `PX` are handled.
+- No `PTTL`, `PERSIST`, `EXPIRE`, or `DEL` yet. `PTTL` is a few lines given
+  `Store.TTL` already returns a duration.
+- No `FLUSHALL`, which makes test scripts carry state between sections.
+- One `RWMutex` covers the whole map, so every writer in the server serialises,
+  and the sweeper is a writer ten times a second. Fine at current scale;
+  revisit if benchmarks show contention.
+- `DBSIZE` counts expired-but-unreclaimed keys, so it can briefly exceed the
+  number of readable keys. That is deliberate — it is what makes the sweeper
+  observable — but it differs from what a client might assume.
 - No `CONFIG` command, so `redis-benchmark` prints "Could not fetch server
   CONFIG" and falls back to defaults. Harmless, but a stub may be worth it.
 
@@ -55,3 +66,9 @@ what that choice costs in memory versus CPU.
   split the flat package into `internal/{resp,store,server}` (ADR-006) and
   added store and dispatch tests, which the package boundary made
   straightforward to write.
+- **Session 5** — Key expiry, both halves (ADR-007). Lazy deletion on read
+  needs a read-lock-to-write-lock gap that Go cannot do atomically, so `Get`
+  re-reads everything after the gap; without that it would delete a value a
+  concurrent client had just written. Active expiry samples 20 keys per round
+  off a volatile index and repeats while a sample is >25% expired, capped at
+  16 rounds. Tests drive a swappable clock rather than sleeping.

@@ -20,10 +20,11 @@ means correctness is judged by an independent tool rather than by my own tests.
       split across any number of TCP packets, verified byte-at-a-time in tests
 - [x] RESP reply encoding — including the null/empty-string distinction that
       lets a cache tell a miss from a stored empty value
-- [x] `PING`, `ECHO`, `SET`, `GET`
+- [x] `PING`, `ECHO`, `SET`, `GET`, `TTL`, `DBSIZE`
 - [x] Concurrent client handling — one goroutine per connection, shared store
       behind an `RWMutex`, verified under `-race`
-- [ ] Key expiry (`EX` / `PX`)
+- [x] Key expiry (`EX` / `PX`) — lazy deletion on read, plus a bounded
+      sampling sweeper for keys nobody ever reads
 - [ ] LRU eviction under memory pressure
 - [ ] Append-only persistence with crash recovery
 

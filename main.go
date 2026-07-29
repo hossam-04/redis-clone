@@ -11,10 +11,17 @@ import (
 	"flag"
 	"log"
 	"net"
+	"time"
 
 	"github.com/hossam-04/redis-clone/internal/server"
 	"github.com/hossam-04/redis-clone/internal/store"
 )
+
+// sweepInterval is how often expired keys nobody has read are swept. Ten
+// times a second, matching Redis. The Store owns no goroutines of its own, so
+// choosing the schedule is the caller's job -- which is also what keeps it
+// testable without one running.
+const sweepInterval = 100 * time.Millisecond
 
 func main() {
 	port := flag.String("port", "6379", "TCP port to listen on")
@@ -29,5 +36,18 @@ func main() {
 	defer ln.Close()
 	log.Printf("listening on :%s", *port)
 
-	log.Fatal(server.New(store.New()).Serve(ln))
+	st := store.New()
+	go sweep(st, sweepInterval)
+
+	log.Fatal(server.New(st).Serve(ln))
+}
+
+// sweep runs active expiry forever. Each call is internally bounded, so this
+// never holds the store's write lock for long no matter how much has expired.
+func sweep(st *store.Store, every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for range tick.C {
+		st.SweepExpired()
+	}
 }

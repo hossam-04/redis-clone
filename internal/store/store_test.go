@@ -45,14 +45,6 @@ func newTestStore() (*Store, *fakeClock) {
 	return s, c
 }
 
-// size reports how many entries are physically present, expired or not. Tests
-// use it to tell "hidden from readers" apart from "actually reclaimed".
-func (s *Store) size() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.m)
-}
-
 func TestGetMissingKey(t *testing.T) {
 	s := New()
 	v, ok := s.Get("nothing")
@@ -144,11 +136,11 @@ func TestExpiredKeyIsReclaimedNotHidden(t *testing.T) {
 	s.SetWithTTL("k", "v", time.Second)
 	clock.Advance(2 * time.Second)
 
-	if s.size() != 1 {
-		t.Fatalf("size = %d before the expired key is touched, want 1", s.size())
+	if s.Len() != 1 {
+		t.Fatalf("size = %d before the expired key is touched, want 1", s.Len())
 	}
 	s.Get("k")
-	if got := s.size(); got != 0 {
+	if got := s.Len(); got != 0 {
 		t.Errorf("size = %d after reading an expired key, want 0 (memory not reclaimed)", got)
 	}
 }
@@ -233,7 +225,7 @@ func TestConcurrentExpiredReads(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := s.size(); got != 0 {
+	if got := s.Len(); got != 0 {
 		t.Errorf("size = %d after all expired keys were read, want 0", got)
 	}
 }
@@ -283,7 +275,7 @@ func TestSweepReclaimsKeysNobodyReads(t *testing.T) {
 	if got := s.SweepExpired(); got != 10 {
 		t.Errorf("swept %d keys, want 10", got)
 	}
-	if got := s.size(); got != 0 {
+	if got := s.Len(); got != 0 {
 		t.Errorf("size = %d after sweep, want 0", got)
 	}
 	if got := s.volatileSize(); got != 0 {
@@ -322,7 +314,7 @@ func TestSweepIgnoresKeysWithoutTTL(t *testing.T) {
 	if got := s.SweepExpired(); got != 0 {
 		t.Errorf("swept %d keys that have no TTL, want 0", got)
 	}
-	if got := s.size(); got != 100 {
+	if got := s.Len(); got != 100 {
 		t.Errorf("size = %d, want 100 -- permanent keys were deleted", got)
 	}
 }
@@ -409,10 +401,10 @@ func TestSweepEventuallyClearsEverything(t *testing.T) {
 	}
 	clock.Advance(2 * time.Second)
 
-	for tick := 0; tick < 100 && s.size() > 0; tick++ {
+	for tick := 0; tick < 100 && s.Len() > 0; tick++ {
 		s.SweepExpired()
 	}
-	if got := s.size(); got != 0 {
+	if got := s.Len(); got != 0 {
 		t.Errorf("size = %d after 100 sweep ticks, want 0", got)
 	}
 }

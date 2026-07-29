@@ -70,6 +70,20 @@ func WriteBulkString(w *bufio.Writer, s string) error {
 	return err
 }
 
+// WriteInteger writes :<n>\r\n.
+//
+// Commands that reply with an integer often reserve negative values as
+// sentinels, since their real answers cannot be negative -- TTL uses -1 for
+// "no expiry" and -2 for "no such key". Same out-of-band trick as the null
+// bulk string: take a value the field can never legitimately hold, and it is
+// free to mean something else.
+func WriteInteger(w *bufio.Writer, n int64) error {
+	w.WriteByte(':')
+	w.WriteString(strconv.FormatInt(n, 10))
+	_, err := w.WriteString("\r\n")
+	return err
+}
+
 // WriteNull writes $-1\r\n -- RESP's "there is no value here".
 //
 // This is what lets GET on a missing key differ from GET on a key holding "".

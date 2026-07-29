@@ -55,3 +55,25 @@ the same way and the tests would pass. The real client is an independent judge
 that fails loudly on a single misplaced byte.
 
 *Would revisit if:* never. This constraint is the backbone of the project.
+
+---
+
+## ADR-004 — `bufio.Reader` for buffering, hand-rolled framing
+
+**Decision:** Buffer socket reads with the standard library's `bufio.Reader`.
+Every byte of RESP framing logic is still written from scratch.
+
+*Alternatives:* Hand-roll the fill/drain/compact buffer; or call `conn.Read`
+directly with no buffering at all.
+
+**Why:** ADR-002 bans libraries from doing the *interesting* part, and the
+interesting part here is framing — knowing where one command ends and the next
+begins. `bufio.Reader` has no idea RESP exists; it is a byte buffer that
+amortises syscalls, nothing more. Without it a parser that pulls a few bytes at
+a time would issue one `read` syscall per pull at roughly 1–2µs each, which
+would dominate the runtime and teach nothing in exchange. Hand-rolling the
+buffer would mainly teach ring-buffer compaction off-by-ones, which is a
+different subject than this project.
+
+*Would revisit if:* profiling shows `bufio`'s copying is a real bottleneck, or
+the learning goal shifts to buffer management specifically.

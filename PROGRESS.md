@@ -6,8 +6,9 @@ code alone does not carry.
 ---
 
 ## Current state
-**Week 0 — environment setup, complete.** Toolchain installed and the repo is
-pushed. No application code written yet.
+**Week 1 — in progress.** TCP listener accepts clients (one goroutine each) and
+the RESP request parser is done and tested. The server still sends no replies,
+so `redis-cli` connects and hangs waiting.
 
 - Go 1.26.5 (darwin/arm64)
 - redis-cli / redis-server 8.8.1 — the real tools, kept as the correctness oracle
@@ -26,8 +27,8 @@ pushed. No application code written yet.
 | 4 | Benchmark with `redis-benchmark`, record throughput + p99, write the README. | ☐ |
 
 ## Next up
-First design decision: how to frame incoming bytes when a client's command
-arrives split across multiple TCP packets.
+Reply encoding (the write path), then command dispatch, so `redis-cli -p 6379
+PING` returns `PONG` and Week 1's bar is met.
 
 ## Open questions
 *(none yet)*
@@ -37,3 +38,7 @@ arrives split across multiple TCP packets.
   Chose Go over Python. Blocked on toolchain install.
 - **Session 2** — Cleared the toolchain blocker: installed Go, Redis, and `gh`.
   Published the repo to GitHub. Week 0 closed; TCP framing is the next problem.
+- **Session 3** — TCP listener, then the RESP request parser (ADR-004). Key
+  idea: the parser takes an `io.Reader`, not a `net.Conn`, so tests can deliver
+  bytes one at a time and prove framing works without touching a network.
+  24 tests green.

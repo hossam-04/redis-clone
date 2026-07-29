@@ -16,7 +16,9 @@ means correctness is judged by an independent tool rather than by my own tests.
 
 ## Features
 
-- [ ] RESP protocol parser (handles commands split across TCP packets)
+- [x] RESP request parsing — length-prefixed framing that survives a command
+      split across any number of TCP packets, verified byte-at-a-time in tests
+- [ ] RESP reply encoding
 - [ ] `PING`, `ECHO`, `SET`, `GET`
 - [ ] Concurrent client handling
 - [ ] Key expiry (`EX` / `PX`)

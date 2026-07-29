@@ -120,7 +120,7 @@ imports both. That is what already makes the parser testable against a
 `strings.Reader` and the store testable without a socket, and it is now
 enforced by the compiler rather than by discipline — `readLine` and
 `readBulkString` are unexported, so protocol internals are genuinely
-unreachable from command handling. As weeks 2–4 add expiry, eviction, and
+unreachable from command handling. As milestones 2–4 add expiry, eviction, and
 persistence, that boundary is what stops the store from growing opinions about
 RESP.
 

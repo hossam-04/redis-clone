@@ -1,9 +1,9 @@
 // Package store holds the key-value data every client shares.
 //
 // It knows nothing about RESP, connections, or command names. Keeping it
-// ignorant of the protocol is what will let week 3 add persistence and week 2
-// add expiry without either one having to care how a client phrased the
-// request.
+// ignorant of the protocol is what will let milestone 3 add persistence and
+// milestone 2 add expiry without either one having to care how a client
+// phrased the request.
 package store
 
 import "sync"
@@ -17,8 +17,8 @@ import "sync"
 //
 // RWMutex rather than Mutex because cache workloads are read-dominated:
 // RLock lets any number of readers run at once, and only writers exclude
-// everyone. Week 2 revisits whether a single lock over the entire map is the
-// right granularity, since it serialises every writer in the server.
+// everyone. Milestone 2 revisits whether a single lock over the entire map is
+// the right granularity, since it serialises every writer in the server.
 type Store struct {
 	mu sync.RWMutex
 	m  map[string]string

@@ -33,7 +33,7 @@ func (s *Server) dispatch(w *bufio.Writer, cmd resp.Command) error {
 		}
 
 	case "SET":
-		// EX / PX and the other options arrive in week 2.
+		// EX / PX and the other options arrive in milestone 2.
 		if len(cmd) == 3 {
 			s.store.Set(cmd[1], cmd[2])
 			return resp.WriteSimpleString(w, "OK")

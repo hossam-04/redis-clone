@@ -51,7 +51,7 @@ go test ./...
 Preliminary smoke numbers only — `redis-benchmark -t set,get -n 20000` on an
 M-series Mac, client and server on loopback. **Not yet a real result:** there is
 no comparison against real Redis, no p99, and no persistence in the write path,
-all of which land in Week 4.
+all of which land in Milestone 4.
 
 | Pipeline depth | Throughput |
 |----------------|------------|

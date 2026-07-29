@@ -25,13 +25,17 @@ means correctness is judged by an independent tool rather than by my own tests.
       behind an `RWMutex`, verified under `-race`
 - [x] Key expiry (`EX` / `PX`) — lazy deletion on read, plus a bounded
       sampling sweeper for keys nobody ever reads
-- [ ] LRU eviction under memory pressure
+- [x] LRU eviction under memory pressure — approximate, by sampling, so reads
+      stay concurrent and eviction stays O(1)
 - [ ] Append-only persistence with crash recovery
 
 ## Running
 
 ```bash
 go run . --port 6379
+
+# with a memory ceiling, above which approximately-LRU keys are evicted
+go run . --port 6379 --maxmemory 64000000 --maxmemory-samples 10
 ```
 
 Then, in another terminal:
@@ -63,6 +67,26 @@ all of which land in Milestone 4.
 The gap between the first row and the rest is one `if` statement: replies are
 flushed only once the read buffer is drained, so a pipelined burst costs a
 single `write` syscall rather than one per command. See ADR-005.
+
+### Eviction accuracy
+
+Eviction approximates LRU by sampling rather than tracking an exact order, so
+it is worth knowing what that costs. A 20-key working set is read every round
+while 800 cold keys stream past a budget of roughly 100 keys — the store turns
+over about eight times. A perfect LRU keeps all 20.
+
+| `maxmemory-samples` | hot keys retained |
+|---------------------|-------------------|
+| 1                   | 0 / 20            |
+| 2                   | 0 / 20            |
+| 5 (default)         | 10 / 20           |
+| 10                  | 18 / 20           |
+| 20                  | 20 / 20           |
+| 50                  | 20 / 20           |
+
+A sample of 1 is random eviction and performs like it. The curve is steep early
+and flat past about 20 — which is why the knob is exposed rather than hardcoded.
+See ADR-008 for why exact LRU was rejected.
 
 ## Layout
 

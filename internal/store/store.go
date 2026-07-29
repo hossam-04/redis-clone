@@ -8,10 +8,16 @@ package store
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // entry is one stored value plus its metadata.
+//
+// Entries live in the map as pointers, and are never copied. That is not a
+// style choice: atime below cannot be copied, and more importantly the
+// pointer is what lets a reader update an entry without writing to the map.
+// See Get.
 //
 // A zero expiresAt means "never expires", which is the common case -- most
 // keys have no TTL, so the zero value has to be the cheap one.
@@ -24,10 +30,21 @@ import (
 type entry struct {
 	value     string
 	expiresAt time.Time
+
+	// atime is the value of the store's clock when this entry was last read
+	// or written. Eviction prefers the smallest.
+	//
+	// Atomic because it is written by readers holding only the read lock,
+	// while eviction reads it under the write lock. Any non-atomic field
+	// would be a data race the moment a GET overlapped an eviction.
+	atime atomic.Uint64
 }
 
 // expired reports whether e has an expiry that has already passed.
-func (e entry) expired(now time.Time) bool {
+//
+// Pointer receiver: a value receiver would copy the struct, and copying an
+// atomic is both meaningless and a vet error.
+func (e *entry) expired(now time.Time) bool {
 	return !e.expiresAt.IsZero() && now.After(e.expiresAt)
 }
 
@@ -44,7 +61,19 @@ func (e entry) expired(now time.Time) bool {
 // the right granularity, since it serialises every writer in the server.
 type Store struct {
 	mu sync.RWMutex
-	m  map[string]entry
+	m  map[string]*entry
+
+	// clock is a counter bumped on every access, and stamped onto the entry
+	// that was touched. It is a logical clock, not a wall clock -- eviction
+	// only ever compares two stamps, so their ordering is all that matters
+	// and no real time is involved.
+	//
+	// Atomic so readers can bump it without the write lock. Note this is a
+	// single contended cache line: at very high throughput every core is
+	// fighting over it. Redis sidesteps that with a coarse clock updated
+	// periodically rather than per access. Worth measuring at milestone 4
+	// before deciding it matters.
+	clock atomic.Uint64
 
 	// volatile indexes exactly the keys that carry a deadline. The sweeper
 	// samples from here rather than from m.
@@ -56,6 +85,18 @@ type Store struct {
 	// holds no timestamps, only names.
 	volatile map[string]struct{}
 
+	// used is the estimated bytes held; maxBytes is the ceiling above which
+	// writes evict. Zero maxBytes means no limit. Both are guarded by mu
+	// rather than atomic, since every path that changes them already holds
+	// the write lock.
+	used     int64
+	maxBytes int64
+
+	// evictSample is how many keys each eviction examines. Larger is a better
+	// approximation of true LRU and costs proportionally more time under the
+	// write lock, which is held during eviction.
+	evictSample int
+
 	// now is swappable so tests can control the passage of time instead of
 	// sleeping. Same idea as the parser taking an io.Reader rather than a
 	// net.Conn: depend on the capability, not the concrete thing, and the
@@ -63,13 +104,71 @@ type Store struct {
 	now func() time.Time
 }
 
-// New returns an empty Store ready for concurrent use.
-func New() *Store {
-	return &Store{
-		m:        make(map[string]entry),
-		volatile: make(map[string]struct{}),
-		now:      time.Now,
+// Option configures a Store.
+type Option func(*Store)
+
+// WithMaxMemory caps the store's estimated size. Once a write pushes it over,
+// approximately-least-recently-used keys are evicted until it fits again.
+// Zero, the default, means no limit and no eviction.
+func WithMaxMemory(bytes int64) Option {
+	return func(s *Store) { s.maxBytes = bytes }
+}
+
+// WithEvictSample sets how many keys each eviction examines before choosing a
+// victim. Higher values approximate true LRU more closely at proportionally
+// more time under the write lock. Values below 1 are ignored.
+func WithEvictSample(n int) Option {
+	return func(s *Store) {
+		if n >= 1 {
+			s.evictSample = n
+		}
 	}
+}
+
+// New returns an empty Store ready for concurrent use.
+func New(opts ...Option) *Store {
+	s := &Store{
+		m:           make(map[string]*entry),
+		volatile:    make(map[string]struct{}),
+		now:         time.Now,
+		evictSample: defaultEvictSample,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// entryOverhead stands in for everything an entry costs beyond its key and
+// value bytes: the map bucket slot, two string headers, the *entry pointer,
+// the entry struct, and allocator rounding.
+//
+// Memory accounting here is deliberately an estimate. Go offers no cheap way
+// to ask what a map entry really occupies -- bucket layout, allocator size
+// classes and GC timing all contribute, and reading the truth means
+// runtime.ReadMemStats, which stops the world and so cannot run on every SET.
+//
+// Real RSS will therefore be higher than this number. That is fine: eviction
+// needs a figure that moves in proportion to actual usage, not an accurate
+// one. A limit that ignored value size, by contrast, would not measure the
+// thing eviction exists to control at all.
+const entryOverhead = 96
+
+func entryCost(key, value string) int64 {
+	return int64(len(key) + len(value) + entryOverhead)
+}
+
+// defaultEvictSample is how many keys a single eviction looks at before
+// picking a victim. Redis defaults to 5 too, and exposes it as
+// maxmemory-samples for the same reason WithEvictSample exists: it is the
+// dial between eviction accuracy and eviction cost.
+const defaultEvictSample = 5
+
+// UsedMemory reports the estimated bytes currently held.
+func (s *Store) UsedMemory() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.used
 }
 
 // Get reports the value and whether the key exists and has not expired. That
@@ -88,6 +187,19 @@ func (s *Store) Get(key string) (string, bool) {
 		return "", false
 	}
 	if !e.expired(s.now()) {
+		// Stamp the access so eviction knows this key is recently used.
+		//
+		// This is a write, on the read-lock path -- and it is safe because it
+		// is not a write to the *map*. The map still holds the same pointer
+		// to the same entry; only a field inside that entry changes, and it
+		// changes atomically. Mutating the contents is not mutating the
+		// container.
+		//
+		// With map[string]entry this would be impossible: updating a field
+		// would mean assigning the slot back, which is a map write, which
+		// needs the write lock, which would serialise every read in the
+		// server and cost us the RWMutex entirely.
+		e.atime.Store(s.clock.Add(1))
 		return e.value, true
 	}
 
@@ -123,8 +235,75 @@ func (s *Store) Get(key string) (string, bool) {
 // Both deletions always happen together: an entry in volatile with no entry in
 // m would be a slot the sweeper wastes a sample on forever.
 func (s *Store) remove(key string) {
+	if e, ok := s.m[key]; ok {
+		s.used -= entryCost(key, e.value)
+	}
 	delete(s.m, key)
 	delete(s.volatile, key)
+}
+
+// evictToLimit removes keys until the store fits under maxBytes, never
+// touching keep -- the key whose write triggered this. Callers must hold the
+// write lock.
+//
+// Protecting keep matters for the degenerate case of a value larger than the
+// whole limit. Without it, the write would be accepted and then immediately
+// evicted as the only candidate, so SET would report OK and the following GET
+// would return nil. Silently discarding what a client just stored is worse
+// than sitting over the limit, so the store stays over instead.
+func (s *Store) evictToLimit(keep string) {
+	if s.maxBytes <= 0 {
+		return
+	}
+	for s.used > s.maxBytes {
+		if !s.evictOne(keep) {
+			return // nothing left that may be evicted
+		}
+	}
+}
+
+// evictOne removes the least recently used key among a small random sample and
+// reports whether anything went. Callers must hold the write lock.
+//
+// Sampling rather than a true LRU order, for two reasons that compound.
+//
+// Finding the genuine minimum means scanning every key, and eviction fires
+// under memory pressure -- precisely when the server can least afford a full
+// scan holding the write lock.
+//
+// Keeping an exact order instead, via the textbook hash-map-plus-linked-list,
+// would mean moving a node on every read. That is a mutation of shared
+// structure, so every GET would need the write lock, and reads across the
+// whole server would serialise. LRU would cost all the read concurrency the
+// RWMutex exists to provide.
+//
+// So this gives up exactness and buys both back. The victim is the oldest of
+// five, which is usually old but is not guaranteed to be the oldest overall.
+func (s *Store) evictOne(keep string) bool {
+	var (
+		victim string
+		oldest uint64
+		found  bool
+	)
+	sampled := 0
+	// Go's randomized range start supplies the sample, same as in sweepRound.
+	for key, e := range s.m {
+		if sampled == s.evictSample {
+			break
+		}
+		if key == keep {
+			continue
+		}
+		sampled++
+		if a := e.atime.Load(); !found || a < oldest {
+			victim, oldest, found = key, a, true
+		}
+	}
+	if !found {
+		return false
+	}
+	s.remove(victim)
+	return true
 }
 
 // Len reports how many entries are resident, counting any that have expired
@@ -173,18 +352,29 @@ func (s *Store) TTL(key string) (d time.Duration, hasTTL, exists bool) {
 // Set stores value under key with no expiry, discarding any TTL the key
 // previously had. That matches Redis: a plain SET clears an existing TTL.
 func (s *Store) Set(key, value string) {
-	s.put(key, entry{value: value})
+	s.put(key, &entry{value: value})
 }
 
 // SetWithTTL stores value under key and expires it after ttl.
 func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
-	s.put(key, entry{value: value, expiresAt: s.now().Add(ttl)})
+	s.put(key, &entry{value: value, expiresAt: s.now().Add(ttl)})
 }
 
-func (s *Store) put(key string, e entry) {
+func (s *Store) put(key string, e *entry) {
+	// A write counts as an access, so a freshly written key is the most
+	// recently used one and will not be the next thing evicted.
+	e.atime.Store(s.clock.Add(1))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// An overwrite replaces the old value, so its bytes stop counting.
+	if old, ok := s.m[key]; ok {
+		s.used -= entryCost(key, old.value)
+	}
 	s.m[key] = e
+	s.used += entryCost(key, e.value)
+
 	// Keep the index honest in both directions. A plain SET over a key that
 	// had a TTL must drop it out of volatile, or the sweeper keeps sampling a
 	// key that can no longer expire.
@@ -193,6 +383,10 @@ func (s *Store) put(key string, e entry) {
 	} else {
 		s.volatile[key] = struct{}{}
 	}
+
+	// Evict only on write. Growth is the only thing that breaches the limit,
+	// so this is the one place that needs to check.
+	s.evictToLimit(key)
 }
 
 // Tuning for the sweeper. These mirror real Redis, which samples 20 keys per

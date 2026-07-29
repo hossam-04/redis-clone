@@ -451,3 +451,164 @@ func TestSweepConcurrentWithClients(t *testing.T) {
 	close(stop)
 	<-swept
 }
+
+// entryCostOfTestKey is the cost of the "kNNN"/"value" pairs the eviction
+// tests write, so limits can be expressed in whole entries.
+var entryCostOfTestKey = entryCost("k000", "value")
+
+func TestNoEvictionWithoutALimit(t *testing.T) {
+	s := New()
+	for i := range 1000 {
+		s.Set(fmt.Sprintf("k%d", i), "value")
+	}
+	if got := s.Len(); got != 1000 {
+		t.Errorf("Len = %d with no limit configured, want 1000", got)
+	}
+}
+
+func TestUsedMemoryTracksWrites(t *testing.T) {
+	s := New()
+	if got := s.UsedMemory(); got != 0 {
+		t.Fatalf("UsedMemory = %d on an empty store, want 0", got)
+	}
+
+	s.Set("k", "value")
+	want := entryCost("k", "value")
+	if got := s.UsedMemory(); got != want {
+		t.Errorf("UsedMemory = %d after one Set, want %d", got, want)
+	}
+
+	// An overwrite must replace the old cost, not add to it.
+	s.Set("k", "a much longer value than before")
+	want = entryCost("k", "a much longer value than before")
+	if got := s.UsedMemory(); got != want {
+		t.Errorf("UsedMemory = %d after overwrite, want %d (old bytes not released?)", got, want)
+	}
+}
+
+func TestUsedMemoryReleasedOnExpiry(t *testing.T) {
+	s, clock := newTestStore()
+	s.SetWithTTL("k", "v", time.Second)
+	clock.Advance(2 * time.Second)
+
+	s.SweepExpired()
+	if got := s.UsedMemory(); got != 0 {
+		t.Errorf("UsedMemory = %d after the entry was swept, want 0", got)
+	}
+}
+
+func TestEvictionKeepsStoreUnderLimit(t *testing.T) {
+	limit := 10 * entryCostOfTestKey
+	s := New(WithMaxMemory(limit))
+
+	for i := range 500 {
+		s.Set(fmt.Sprintf("k%03d", i), "value")
+	}
+	if got := s.UsedMemory(); got > limit {
+		t.Errorf("UsedMemory = %d after 500 writes, want <= %d", got, limit)
+	}
+	if got := s.Len(); got > 10 {
+		t.Errorf("Len = %d, want at most 10 given the limit", got)
+	}
+}
+
+// TestEvictionPrefersLeastRecentlyUsed is deterministic despite sampling:
+// there are only four keys and the sample size is five, so every key is
+// examined and the choice is exact.
+func TestEvictionPrefersLeastRecentlyUsed(t *testing.T) {
+	// Three entries fit exactly; the fourth forces one eviction.
+	limit := 3 * entryCost("a", "x")
+	s := New(WithMaxMemory(limit))
+
+	s.Set("a", "x")
+	s.Set("b", "x")
+	s.Set("c", "x")
+
+	// Touch a and b, leaving c as the least recently used.
+	s.Get("a")
+	s.Get("b")
+
+	s.Set("d", "x")
+
+	if _, ok := s.Get("c"); ok {
+		t.Error("c was the least recently used key but survived eviction")
+	}
+	for _, key := range []string{"a", "b", "d"} {
+		if _, ok := s.Get(key); !ok {
+			t.Errorf("%s was recently used but was evicted", key)
+		}
+	}
+}
+
+// TestWriteLargerThanLimitIsKept covers the degenerate case. Accepting a write
+// and then immediately evicting it would make SET report OK while the very
+// next GET returned nil.
+func TestWriteLargerThanLimitIsKept(t *testing.T) {
+	s := New(WithMaxMemory(10)) // smaller than a single entry's overhead
+	s.Set("k", "value")
+
+	if v, ok := s.Get("k"); !ok || v != "value" {
+		t.Errorf("Get = %q, %v; a value larger than the whole limit must still be stored", v, ok)
+	}
+	if got := s.UsedMemory(); got <= 10 {
+		t.Errorf("UsedMemory = %d, expected the store to sit over its limit here", got)
+	}
+}
+
+// TestEvictionUnderConcurrency runs eviction against live readers and writers.
+// Under -race this is what would catch atime being read during eviction while
+// a reader stamps it.
+func TestEvictionUnderConcurrency(t *testing.T) {
+	s := New(WithMaxMemory(50 * entryCostOfTestKey))
+
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := range 400 {
+				key := fmt.Sprintf("k%d:%03d", g, i)
+				s.Set(key, "value")
+				s.Get(key)
+				s.Get(fmt.Sprintf("k%d:%03d", g, i/2)) // re-read something older
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got, limit := s.UsedMemory(), int64(50*entryCostOfTestKey); got > limit {
+		t.Errorf("UsedMemory = %d after concurrent load, want <= %d", got, limit)
+	}
+}
+
+func TestWithEvictSampleRejectsNonsense(t *testing.T) {
+	// A sample size below 1 would make evictOne examine nothing and never
+	// find a victim, so the limit would silently stop being enforced.
+	for _, n := range []int{0, -1} {
+		s := New(WithEvictSample(n))
+		if s.evictSample != defaultEvictSample {
+			t.Errorf("WithEvictSample(%d) set sample to %d, want the default %d",
+				n, s.evictSample, defaultEvictSample)
+		}
+	}
+}
+
+// TestLimitHoldsAtAnySampleSize checks the property that must not depend on
+// sample size. Accuracy degrades as the sample shrinks -- a sample of 1 is
+// random eviction -- but the memory ceiling is not an approximation and has
+// to hold regardless.
+func TestLimitHoldsAtAnySampleSize(t *testing.T) {
+	for _, n := range []int{1, 2, 5, 50} {
+		t.Run(fmt.Sprintf("sample=%d", n), func(t *testing.T) {
+			limit := 20 * entryCostOfTestKey
+			s := New(WithMaxMemory(limit), WithEvictSample(n))
+
+			for i := range 500 {
+				s.Set(fmt.Sprintf("k%03d", i), "value")
+			}
+			if got := s.UsedMemory(); got > limit {
+				t.Errorf("UsedMemory = %d, want <= %d", got, limit)
+			}
+		})
+	}
+}

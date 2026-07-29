@@ -25,6 +25,10 @@ const sweepInterval = 100 * time.Millisecond
 
 func main() {
 	port := flag.String("port", "6379", "TCP port to listen on")
+	maxMemory := flag.Int64("maxmemory", 0,
+		"evict approximately-least-recently-used keys above this many estimated bytes (0 = unlimited)")
+	evictSamples := flag.Int("maxmemory-samples", 5,
+		"keys examined per eviction; higher approximates true LRU more closely at more cost")
 	flag.Parse()
 
 	// net.Listen binds the port and has the kernel start queueing inbound
@@ -36,7 +40,14 @@ func main() {
 	defer ln.Close()
 	log.Printf("listening on :%s", *port)
 
-	st := store.New()
+	st := store.New(
+		store.WithMaxMemory(*maxMemory),
+		store.WithEvictSample(*evictSamples),
+	)
+	if *maxMemory > 0 {
+		log.Printf("memory limit: %d estimated bytes, approximate LRU over %d samples",
+			*maxMemory, *evictSamples)
+	}
 	go sweep(st, sweepInterval)
 
 	log.Fatal(server.New(st).Serve(ln))

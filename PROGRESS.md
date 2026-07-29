@@ -6,11 +6,14 @@ code alone does not carry.
 ---
 
 ## Current state
-**Milestone 2 — expiry done, eviction next.** Keys now expire two ways: on read
-(lazy) and via a bounded sampling sweeper on a 100ms tick (active). `SET k v EX
-10`, `PX`, and `TTL`'s three states all work against real `redis-cli`. Verified
-end to end: 200 keys with `EX 1` that nothing ever reads drop out of `DBSIZE`
-on their own within about a second.
+**Milestone 2 — done.** Keys expire two ways: on read (lazy) and via a bounded
+sampling sweeper on a 100ms tick (active). `SET k v EX 10`, `PX`, and `TTL`'s
+three states all work against real `redis-cli`; 200 keys with `EX 1` that
+nothing ever reads drop out of `DBSIZE` on their own within about a second.
+
+Eviction holds a memory ceiling by approximating LRU: entries carry an atomic
+access stamp written under the *read* lock, and eviction deletes the oldest of
+a small random sample. 2000 writes into a ~100-key budget settle at 100 keys.
 
 Milestone 1 delivered the listener, the RESP parser and encoder, dispatch, and
 the mutex-guarded store.
@@ -27,15 +30,16 @@ the mutex-guarded store.
 | Milestone | Goal | Done |
 |-----------|------|------|
 | 1 | TCP listener, RESP parser, `PING` / `ECHO` / `SET` / `GET`. Bar: `redis-cli` connects. | ☑ |
-| 2 | Concurrent clients, key expiry (`PX` / `EX`), LRU eviction under memory pressure. | ☐ |
+| 2 | Concurrent clients, key expiry (`PX` / `EX`), LRU eviction under memory pressure. | ☑ |
 | 3 | Append-only log, replay on startup, survive `kill -9` with no data loss. | ☐ |
 | 4 | Benchmark with `redis-benchmark`, record throughput + p99, write the README. | ☐ |
 
 ## Next up
-LRU eviction, the second half of milestone 2. The design question: tracking
-true least-recently-used needs a per-key access order, and maintaining an exact
-one on every read means a write on every read — which would turn `Get` into a
-writer and destroy the point of the `RWMutex`. Redis approximates instead.
+Milestone 3: append-only persistence and crash recovery. Bar is `kill -9` with
+no data loss. First design question is what "no data loss" can even mean given
+that a write returning from the kernel is not a write on the disk — which is
+the difference between `write` and `fsync`, and the reason durability is a
+tunable rather than a yes/no.
 
 ## Open questions
 - `SET` still ignores `NX` / `XX` / `KEEPTTL`; only `EX` and `PX` are handled.
@@ -72,3 +76,9 @@ writer and destroy the point of the `RWMutex`. Redis approximates instead.
   concurrent client had just written. Active expiry samples 20 keys per round
   off a volatile index and repeats while a sample is >25% expired, capped at
   16 rounds. Tests drive a swappable clock rather than sleeping.
+- **Session 6** — Approximate LRU eviction (ADR-008). The load-bearing change
+  was `map[string]entry` to `map[string]*entry`: with values, stamping an
+  access means assigning the map slot back, which needs the write lock and
+  serialises every read in the server. With pointers the map is untouched and
+  only an atomic field inside the entry changes. Measured the accuracy the
+  sampling costs — 10/20 of a working set retained at 5 samples, 20/20 at 20.

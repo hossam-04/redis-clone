@@ -176,3 +176,62 @@ names only; deadlines stay in the entry so `Get` still needs one lookup.
 Sampling is eventually-consistent by construction — a key can outlive its TTL
 in memory, though never in a reply, since `Get` checks the deadline before
 answering.
+
+---
+
+## ADR-008 — Approximate LRU: sampled eviction, atomic access stamps
+
+**Decision:** Evict by stamping every entry with a logical clock value on
+access and, when over the memory limit, deleting the oldest of a small random
+sample (5 by default, `--maxmemory-samples`). Entries are stored as pointers so
+the stamp can be written atomically under the *read* lock.
+
+*Alternatives:* Exact LRU via a hash map plus intrusive doubly-linked list.
+Full scan for the true minimum. Random eviction.
+
+**Why:** The textbook exact-LRU structure is a hash map with a linked list,
+moving a node to the front on every read. It is O(1) and it is wrong here:
+moving a node mutates shared structure, so every `GET` would need the write
+lock, and reads across the entire server would serialise. LRU would cost all
+the read concurrency the `RWMutex` exists to provide.
+
+Scanning for the true minimum instead is O(n) per eviction, and eviction fires
+under memory pressure — precisely when the server can least afford a full walk
+holding the write lock.
+
+Sampling gives up exactness and buys back both. Measured on this server, with a
+20-key working set read every round while 800 cold keys stream past a ~100-key
+budget:
+
+| `maxmemory-samples` | hot keys retained |
+|---------------------|-------------------|
+| 1                   | 0 / 20            |
+| 2                   | 0 / 20            |
+| 5 (default)         | 10 / 20           |
+| 10                  | 18 / 20           |
+| 20                  | 20 / 20           |
+| 50                  | 20 / 20           |
+
+A sample of 1 is random eviction and behaves like it. The curve is steep early
+and flat after about 20, which is why the knob exists and why 5 is a
+defensible default rather than an obviously correct one.
+
+Keeping the stamps cheap needed one more thing: `map[string]*entry` rather than
+`map[string]entry`. With values, updating a field means assigning the slot
+back, which is a map write, which needs the write lock. With pointers the map
+never changes on a read — only the struct it points at, through an
+`atomic.Uint64`. Mutating the contents is not mutating the container. The cost
+is a pointer and an allocation per entry.
+
+The memory limit itself is an estimate: key bytes plus value bytes plus a flat
+96-byte constant. Go offers no cheap way to ask what a map entry truly costs,
+and the honest answer needs `runtime.ReadMemStats`, which stops the world and
+so cannot run per `SET`. Real RSS is higher. That is acceptable because
+eviction needs a number that moves in proportion to usage, not an accurate one
+— whereas a key-count limit would ignore value size entirely and so would not
+measure the thing eviction exists to control.
+
+*Would revisit if:* eviction quality at the default sample size proves too poor
+for a real workload. Redis's answer is an eviction pool that carries the best
+candidates across samplings, which recovers much of the accuracy without
+raising the per-eviction cost.

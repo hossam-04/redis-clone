@@ -20,8 +20,9 @@ means correctness is judged by an independent tool rather than by my own tests.
       split across any number of TCP packets, verified byte-at-a-time in tests
 - [x] RESP reply encoding — including the null/empty-string distinction that
       lets a cache tell a miss from a stored empty value
-- [ ] `PING`, `ECHO`, `SET`, `GET`
-- [ ] Concurrent client handling
+- [x] `PING`, `ECHO`, `SET`, `GET`
+- [x] Concurrent client handling — one goroutine per connection, shared store
+      behind an `RWMutex`, verified under `-race`
 - [ ] Key expiry (`EX` / `PX`)
 - [ ] LRU eviction under memory pressure
 - [ ] Append-only persistence with crash recovery
@@ -47,8 +48,20 @@ go test ./...
 
 ## Benchmarks
 
-*To be filled in Week 4 — throughput and p99 latency measured with
-`redis-benchmark`, compared against real Redis on the same machine.*
+Preliminary smoke numbers only — `redis-benchmark -t set,get -n 20000` on an
+M-series Mac, client and server on loopback. **Not yet a real result:** there is
+no comparison against real Redis, no p99, and no persistence in the write path,
+all of which land in Week 4.
+
+| Pipeline depth | Throughput |
+|----------------|------------|
+| none           | ~90–97k ops/sec |
+| 16             | ~1.5M ops/sec   |
+| 64             | ~2.2–4.0M ops/sec |
+
+The gap between the first row and the rest is one `if` statement: replies are
+flushed only once the read buffer is drained, so a pipelined burst costs a
+single `write` syscall rather than one per command. See ADR-005.
 
 ## Design notes
 

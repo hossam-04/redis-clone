@@ -77,3 +77,28 @@ different subject than this project.
 
 *Would revisit if:* profiling shows `bufio`'s copying is a real bottleneck, or
 the learning goal shifts to buffer management specifically.
+
+---
+
+## ADR-005 — Flush replies only when the read buffer is drained
+
+**Decision:** Call `Flush` when `bufio.Reader.Buffered() == 0`, not after every
+command.
+
+*Alternatives:* Flush after every command (simple, obviously correct); flush
+every N commands, or on a timer.
+
+**Why:** `Flush` is a `write` syscall. One per reply is pure waste when a client
+has already pipelined a burst — we can answer the whole burst with a single
+write. Measured on this machine: ~90k ops/sec flushing per command, ~1.5M at
+pipeline depth 16. Count- or timer-based batching was rejected because it
+breaks the simple case: a client that sends one command and waits would sit
+there until the batch filled or the timer expired. An empty read buffer is the
+precise moment we are about to block, and flushing before blocking is exactly
+the guarantee needed — no client ever waits on a reply still sitting in our
+buffer.
+
+*Would revisit if:* a client sends a partial command and then waits on replies
+to earlier ones. `Buffered() != 0` would suppress the flush while `ReadCommand`
+blocks on the remainder. No real client behaves this way, and the only victim
+is the connection that did it, but it is the known soft spot in this rule.

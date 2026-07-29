@@ -70,6 +70,27 @@ func WriteBulkString(w *bufio.Writer, s string) error {
 	return err
 }
 
+// WriteCommand writes cmd in exactly the form a client would send it:
+// *<n>\r\n followed by each argument as a bulk string.
+//
+// This exists for the append-only log, and the reuse is the point: commands
+// are stored in precisely the format ReadCommand already parses, so replay
+// needs no second parser and cannot drift out of step with the wire format.
+// If we can read it from a client, we can read it from the log.
+func WriteCommand(w *bufio.Writer, cmd Command) error {
+	w.WriteByte('*')
+	w.WriteString(strconv.Itoa(len(cmd)))
+	if _, err := w.WriteString("\r\n"); err != nil {
+		return err
+	}
+	for _, arg := range cmd {
+		if err := WriteBulkString(w, arg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // WriteInteger writes :<n>\r\n.
 //
 // Commands that reply with an integer often reserve negative values as

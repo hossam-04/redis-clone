@@ -40,13 +40,27 @@ func (s *Server) dispatch(w *bufio.Writer, cmd resp.Command) error {
 		switch len(cmd) {
 		case 3:
 			s.store.Set(cmd[1], cmd[2])
+			if err := s.record(cmd); err != nil {
+				return err
+			}
 			return resp.WriteSimpleString(w, "OK")
 		case 5:
-			ttl, errMsg := parseExpiry(cmd[3], cmd[4])
+			deadline, errMsg := parseExpiry(cmd[3], cmd[4], time.Now())
 			if errMsg != "" {
 				return resp.WriteError(w, errMsg)
 			}
-			s.store.SetWithTTL(cmd[1], cmd[2], ttl)
+			s.store.SetWithDeadline(cmd[1], cmd[2], deadline)
+			// Record the resolved deadline, never the relative form the client
+			// used. "EX 3600" replayed three hours later would grant a fresh
+			// hour to a key that should already be gone, and enough restarts
+			// would make TTL'd keys immortal. PXAT means the same instant
+			// whenever it is read.
+			if err := s.record(resp.Command{
+				"SET", cmd[1], cmd[2],
+				"PXAT", strconv.FormatInt(deadline.UnixMilli(), 10),
+			}); err != nil {
+				return err
+			}
 			return resp.WriteSimpleString(w, "OK")
 		}
 
@@ -91,39 +105,87 @@ func (s *Server) dispatch(w *bufio.Writer, cmd resp.Command) error {
 		"ERR wrong number of arguments for '%s' command", strings.ToLower(cmd[0])))
 }
 
-// parseExpiry turns a SET option pair like ("EX", "10") into a duration.
+// record appends a state-changing command to the log, if one is configured.
 //
-// It returns a RESP error message rather than a Go error because these strings
-// are part of the wire contract: ADR-003 makes real redis-cli the correctness
-// bar, and clients do match on Redis's exact error text. An empty string means
-// the parse succeeded.
-func parseExpiry(unit, value string) (time.Duration, string) {
+// Only state-changing commands go in. Logging a GET would be harmless on
+// replay but would grow the file with reads, which on a read-heavy cache is
+// nearly all of the traffic.
+//
+// The command recorded is not always the one the client sent -- see the SET
+// case, which rewrites a relative expiry into an absolute one.
+func (s *Server) record(cmd resp.Command) error {
+	if s.log == nil {
+		return nil
+	}
+	return s.log.Append(cmd)
+}
+
+const errInvalidExpiry = "ERR invalid expire time in 'set' command"
+
+// parseExpiry turns a SET option pair like ("EX", "10") into the absolute
+// instant the key should die.
+//
+// It returns an instant rather than a duration on purpose. A relative expiry
+// only means anything at the moment it was issued: "EX 3600" recorded in the
+// append-only log and replayed three hours later would grant a fresh hour to a
+// key that should already be gone, and enough restarts would make TTL'd keys
+// immortal. Resolving to an absolute deadline here means the value written to
+// the log means the same thing whenever it is read.
+//
+// The EXAT and PXAT forms exist for exactly that: they carry a Unix timestamp,
+// and they are what the log stores.
+//
+// The returned string is a RESP error message rather than a Go error because
+// these strings are part of the wire contract -- ADR-003 makes real redis-cli
+// the correctness bar, and clients do match on Redis's exact error text. An
+// empty string means the parse succeeded.
+func parseExpiry(unit, value string, now time.Time) (time.Time, string) {
 	n, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
-		return 0, "ERR value is not an integer or out of range"
+		return time.Time{}, "ERR value is not an integer or out of range"
 	}
 
-	var scale time.Duration
+	var (
+		scale    time.Duration
+		absolute bool
+	)
 	switch strings.ToUpper(unit) {
 	case "EX":
 		scale = time.Second
 	case "PX":
 		scale = time.Millisecond
+	case "EXAT":
+		scale, absolute = time.Second, true
+	case "PXAT":
+		scale, absolute = time.Millisecond, true
 	default:
-		return 0, "ERR syntax error"
+		return time.Time{}, "ERR syntax error"
 	}
 
-	// Zero and negative expiries are rejected outright rather than treated as
-	// "delete immediately", which is what Redis does.
-	//
-	// The upper bound is not paranoia: time.Duration is an int64 count of
-	// nanoseconds, so it tops out around 292 years. "EX 999999999999" would
-	// overflow the multiplication below and wrap to a negative duration --
-	// producing a key that is already expired, from a client asking for a
-	// very long life. Silently doing the opposite of what was asked is worse
-	// than refusing.
-	if n <= 0 || n > int64(math.MaxInt64)/int64(scale) {
-		return 0, "ERR invalid expire time in 'set' command"
+	// Both forms multiply by scale to reach nanoseconds, and time.Duration is
+	// an int64 count of those -- roughly 292 years' worth. Past that the
+	// multiplication wraps negative, which for a relative expiry would hand
+	// back an already-dead key to a client that asked for a very long-lived
+	// one. Silently doing the opposite of the request is worse than refusing.
+	if n > int64(math.MaxInt64)/int64(scale) || n < int64(math.MinInt64)/int64(scale) {
+		return time.Time{}, errInvalidExpiry
 	}
-	return time.Duration(n) * scale, ""
+
+	if absolute {
+		// A timestamp in the past is legal and means the key is already
+		// expired -- which is precisely the case a replayed log produces when
+		// a deadline passed during the outage.
+		//
+		// Note this instant carries no monotonic reading, so comparisons
+		// against it use the wall clock. That is inherent: an absolute
+		// timestamp is a wall-clock idea. Relative expiries below keep their
+		// monotonic reading and so stay immune to the clock being stepped.
+		return time.Unix(0, 0).Add(time.Duration(n) * scale), ""
+	}
+	if n <= 0 {
+		// Zero and negative relative expiries are rejected rather than treated
+		// as "delete immediately", matching Redis.
+		return time.Time{}, errInvalidExpiry
+	}
+	return now.Add(time.Duration(n) * scale), ""
 }

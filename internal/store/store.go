@@ -355,9 +355,19 @@ func (s *Store) Set(key, value string) {
 	s.put(key, &entry{value: value})
 }
 
-// SetWithTTL stores value under key and expires it after ttl.
+// SetWithTTL stores value under key and expires it ttl from now.
 func (s *Store) SetWithTTL(key, value string, ttl time.Duration) {
-	s.put(key, &entry{value: value, expiresAt: s.now().Add(ttl)})
+	s.SetWithDeadline(key, value, s.now().Add(ttl))
+}
+
+// SetWithDeadline stores value under key and expires it at a fixed instant.
+//
+// A deadline already in the past is accepted rather than rejected: the key
+// lands already expired and is reclaimed on first read or by the sweeper.
+// That is exactly what replaying a log needs, since a deadline may well have
+// passed while the server was down.
+func (s *Store) SetWithDeadline(key, value string, at time.Time) {
+	s.put(key, &entry{value: value, expiresAt: at})
 }
 
 func (s *Store) put(key string, e *entry) {

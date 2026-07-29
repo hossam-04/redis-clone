@@ -2,8 +2,10 @@ package server
 
 import (
 	"bufio"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hossam-04/redis-clone/internal/resp"
 	"github.com/hossam-04/redis-clone/internal/store"
@@ -193,5 +195,90 @@ func TestPlainSetClearsTTL(t *testing.T) {
 
 	if got, want := run(t, s, resp.Command{"TTL", "k"}), ":-1\r\n"; got != want {
 		t.Errorf("TTL after a plain SET = %q, want %q (the TTL survived)", got, want)
+	}
+}
+
+// TestSetWithAbsoluteExpiry covers the EXAT/PXAT forms. These exist so the
+// append-only log can record a deadline that means the same thing whenever it
+// is replayed, rather than a duration that restarts on every restart.
+func TestSetWithAbsoluteExpiry(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+
+	tests := []struct {
+		name    string
+		cmd     resp.Command
+		wantSet string
+		wantGet string // "" means "expect the key to be readable"
+	}{
+		{
+			"PXAT in the future",
+			resp.Command{"SET", "k", "v", "PXAT", strconv.FormatInt(future.UnixMilli(), 10)},
+			"+OK\r\n", "",
+		},
+		{
+			"EXAT in the future",
+			resp.Command{"SET", "k", "v", "EXAT", strconv.FormatInt(future.Unix(), 10)},
+			"+OK\r\n", "",
+		},
+		{
+			"lowercase pxat",
+			resp.Command{"SET", "k", "v", "pxat", strconv.FormatInt(future.UnixMilli(), 10)},
+			"+OK\r\n", "",
+		},
+		{
+			// A deadline in the past is accepted, not rejected. Replaying a
+			// log produces exactly this whenever a TTL lapsed during the
+			// outage, and the key must come back already dead.
+			"PXAT in the past",
+			resp.Command{"SET", "k", "v", "PXAT", "1000"},
+			"+OK\r\n", "$-1\r\n",
+		},
+		{
+			"EXAT in the past",
+			resp.Command{"SET", "k", "v", "EXAT", "1"},
+			"+OK\r\n", "$-1\r\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New(store.New())
+			if got := run(t, s, tt.cmd); got != tt.wantSet {
+				t.Fatalf("SET = %q, want %q", got, tt.wantSet)
+			}
+			got := run(t, s, resp.Command{"GET", "k"})
+			if tt.wantGet == "" {
+				if got == "$-1\r\n" {
+					t.Errorf("GET = null, but the deadline is in the future")
+				}
+			} else if got != tt.wantGet {
+				t.Errorf("GET = %q, want %q", got, tt.wantGet)
+			}
+		})
+	}
+}
+
+// TestRelativeExpiryIsResolvedAtSetTime is the property that makes the log
+// replay-safe. Two SETs of the same relative TTL issued at different moments
+// must produce different deadlines, so that recording the deadline (rather
+// than the duration) captures when the key actually dies.
+func TestRelativeExpiryIsResolvedAtSetTime(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	early, errMsg := parseExpiry("EX", "3600", base)
+	if errMsg != "" {
+		t.Fatalf("parseExpiry: %s", errMsg)
+	}
+	late, errMsg := parseExpiry("EX", "3600", base.Add(3*time.Hour))
+	if errMsg != "" {
+		t.Fatalf("parseExpiry: %s", errMsg)
+	}
+
+	if !early.Before(late) {
+		t.Errorf("EX 3600 resolved to %v at 12:00 and %v at 15:00; the same instant means replay would extend TTLs",
+			early, late)
+	}
+	if want := base.Add(time.Hour); !early.Equal(want) {
+		t.Errorf("EX 3600 at %v = %v, want %v", base, early, want)
 	}
 }

@@ -27,7 +27,8 @@ means correctness is judged by an independent tool rather than by my own tests.
       sampling sweeper for keys nobody ever reads
 - [x] LRU eviction under memory pressure — approximate, by sampling, so reads
       stay concurrent and eviction stays O(1)
-- [ ] Append-only persistence with crash recovery
+- [x] Append-only persistence with crash recovery — `kill -9` loses nothing,
+      a torn log tail is repaired on startup, TTLs keep running while down
 
 ## Running
 
@@ -36,6 +37,9 @@ go run . --port 6379
 
 # with a memory ceiling, above which approximately-LRU keys are evicted
 go run . --port 6379 --maxmemory 64000000 --maxmemory-samples 10
+
+# with persistence: writes are logged and replayed on startup
+go run . --port 6379 --appendonly --appendfsync everysec
 ```
 
 Then, in another terminal:
@@ -114,6 +118,45 @@ and `store` unaware of each other:
 
 That is why the parser can be tested against a `strings.Reader` with no server
 running, and the store against no socket at all. See ADR-006.
+
+## Durability
+
+Writes go to an append-only log of RESP commands, replayed on startup. What
+that log guarantees depends on `--appendfsync`, and the distinction is the whole
+subject:
+
+| | `kill -9` | Power loss |
+|---|---|---|
+| `always` | no loss | no loss |
+| `everysec` *(default)* | no loss | up to ~1s of acknowledged writes |
+| `no` | no loss | whatever the kernel had not written |
+
+Every setting survives `kill -9`, because `kill -9` only kills the process — the
+kernel still holds the bytes and writes them out. `fsync` is what protects
+against the machine itself dying, and it costs milliseconds against microseconds
+for a plain write.
+
+So `everysec` is making a real concession: **a client can be told `+OK` for a
+write that a power cut then erases.** That is Redis's default too, and it is a
+defensible trade, but it is a trade rather than a free lunch.
+
+Two properties that are less obvious than they look:
+
+- **Replies never outrun the log.** The log is flushed to the kernel before any
+  reply is sent, so every acknowledgement the client ever saw corresponds to
+  bytes the kernel is holding. See ADR-009.
+- **TTLs keep running while the server is down.** The log records absolute
+  deadlines, not the relative `EX 3600` a client sent — otherwise every restart
+  would renew every TTL and TTL'd keys would become immortal. See ADR-010.
+
+A log ending mid-command is treated as a crash rather than corruption: it is
+truncated to the last complete command and the server starts. Malformed bytes
+anywhere *but* the tail cannot be explained by a crash, so the server refuses to
+start rather than serve data it cannot vouch for. See ADR-011.
+
+**Not implemented:** log compaction. The log grows with total writes, not with
+data size, so a key written a million times costs a million records and replay
+time to match. Redis solves this with `BGREWRITEAOF`.
 
 ## Design notes
 

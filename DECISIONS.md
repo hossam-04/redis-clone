@@ -235,3 +235,136 @@ measure the thing eviction exists to control.
 for a real workload. Redis's answer is an eviction pool that carries the best
 candidates across samplings, which recovers much of the accuracy without
 raising the per-eviction cost.
+
+---
+
+## ADR-009 — Persistence is an append-only log of RESP commands
+
+**Decision:** Append every state-changing command to a file, in the same RESP
+form clients send, and replay it on startup. Flush the log to the kernel before
+replying to the client. `fsync` on a policy: `always`, `everysec` (default), or
+`no`.
+
+*Alternatives:* Periodic snapshots of the whole keyspace (Redis's RDB). A custom
+binary log format. Logging the resulting state rather than the command.
+
+**Why the same format clients use:** replay hands the file straight to
+`ReadCommand`. There is no second parser, so there is no second parser to keep
+in step — a log format of its own would be free to drift away from the wire
+format, and the drift would only show up during recovery, which is the worst
+possible time to discover a bug. It also means anything a client can say, the
+log can hold, for free.
+
+**Why append rather than snapshot:** an append is O(1) per write and loses at
+most the tail on a crash. A snapshot has to walk the entire keyspace, so its
+cost scales with the data rather than the change, and everything written between
+snapshots is lost. Real Redis offers both; the log is the one that teaches
+durability.
+
+**Why flush before replying:** a reply is a promise that the command was
+accepted. Sending it while the command still sits in this process's buffer means
+`kill -9` loses a write we already confirmed. Flushing first makes every
+acknowledgement the client ever saw correspond to bytes the kernel holds. It
+rides the same batching rule as ADR-005, so a pipelined burst costs one log
+write rather than one per command.
+
+**Why fsync is a separate dial:** `write` and "the data is on the disk" are
+different claims. `write` hands bytes to the kernel, which acknowledges them and
+passes them to the drive whenever convenient. `fsync` forces the issue and
+waits, at milliseconds against microseconds — a thousandfold difference, which
+is why it cannot be unconditional.
+
+That yields two failure modes, and they are not equally severe:
+
+| Failure | What dies | Survives with |
+|---|---|---|
+| `kill -9` | the process only | `write` — the kernel is still there |
+| Power loss | the machine | `fsync` |
+
+Our stated bar is `kill -9`, so flushing suffices for it and `fsync` addresses
+the harder case. `everysec` is the default, and it is worth being blunt about
+what it concedes: **a client can receive `+OK` for a write that a power failure
+then erases**, up to a second's worth. That is a real lie about durability, and
+choosing the default means choosing to tell it.
+
+*Would revisit if:* the log's unbounded growth becomes the binding problem
+before power-loss durability does. There is no compaction yet — a key written a
+million times produces a million records, and replay time grows with total
+writes rather than with data size. Redis's answer is `BGREWRITEAOF`, which
+rewrites the log as the shortest command sequence that reproduces current state.
+
+---
+
+## ADR-010 — The log records absolute deadlines, never relative TTLs
+
+**Decision:** A `SET` carrying `EX`/`PX` is written to the log as `SET key value
+PXAT <unix-millis>`. `parseExpiry` resolves every expiry form to an instant
+before anything else sees it.
+
+*Alternatives:* Log the command verbatim. Log a separate expiry record
+alongside it.
+
+**Why:** a relative expiry only means anything at the moment it was issued.
+Recorded verbatim:
+
+```
+14:00   SET session data EX 3600     → logged as "EX 3600"
+14:30   crash
+17:00   restart, replay
+```
+
+Replaying `EX 3600` at 17:00 grants a fresh hour to a key that should have died
+at 15:00. Worse, it compounds: every restart renews every TTL, so on a server
+that restarts periodically, TTL'd keys become effectively immortal — and the
+symptom is unbounded memory growth in a cache that looks correctly configured.
+
+Resolving to an instant at `SET` time makes the recorded value mean the same
+thing whenever it is read. A deadline already in the past is accepted rather
+than rejected, because that is exactly what replay produces when a TTL lapsed
+during the outage: the key is restored already dead and the sweeper reclaims it.
+
+One consequence worth naming: an absolute timestamp carries no monotonic clock
+reading, so comparisons against it use the wall clock. That is inherent — an
+absolute instant is a wall-clock idea — and it means a replayed deadline is
+vulnerable to the system clock being stepped in a way a live relative TTL is
+not. Verified empirically: a key set with `EX 3` before a `kill -9` and a
+five-second outage comes back gone, not renewed.
+
+*Would revisit if:* never for the log. This is not a preference, it is a
+correctness requirement.
+
+---
+
+## ADR-011 — A torn tail is recovered; damage anywhere else refuses to start
+
+**Decision:** On replay, a partial command at the end of the log is truncated
+away and the server starts. Malformed bytes anywhere else are a fatal error.
+
+*Alternatives:* Always refuse on any parse failure. Always skip bad records and
+continue. Truncate at the first bad byte wherever it is.
+
+**Why:** a partial record at the tail is not a bug, it is **the normal signature
+of a crash**. A process killed mid-append leaves a prefix of the last record,
+every time. Refusing to start on it would mean never recovering from precisely
+the event this log exists to survive.
+
+Truncating is also necessary rather than merely tolerant: leaving the fragment
+in place would put the next append after garbage, converting a recoverable tail
+into corruption in the middle of the file.
+
+Damage elsewhere is a different claim about the world. Appends are sequential
+and `O_APPEND` never seeks, so a crash **cannot** produce a bad record followed
+by good ones. If that is what the file contains, something we do not understand
+has altered it, and starting anyway would silently serve wrong data. The file is
+left untouched in that case, since we cannot tell good bytes from bad and
+truncating would destroy evidence.
+
+The tail is identified by **byte offset, not by error kind** — a subtlety worth
+recording. A record cut off inside a header line surfaces as plain `io.EOF`,
+indistinguishable from a clean end of file. Trusting the error would leave the
+fragment on disk. So replay tracks the offset just past the last command that
+applied, and compares.
+
+*Would revisit if:* crashes start producing zero-filled tails rather than short
+ones, which some filesystems do. Those parse as malformed rather than short and
+would currently be treated as unexplained corruption.

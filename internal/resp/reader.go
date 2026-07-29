@@ -1,4 +1,11 @@
-package main
+// Package resp implements the Redis serialization protocol -- the wire format
+// spoken by redis-cli and every other Redis client.
+//
+// This package knows nothing about storage, connections, or what any command
+// means. It turns a byte stream into commands and writes replies back. That
+// ignorance is deliberate and is what makes the parser testable against a
+// strings.Reader with no server running anywhere.
+package resp
 
 import (
 	"bufio"

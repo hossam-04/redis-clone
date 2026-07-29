@@ -1,4 +1,4 @@
-package main
+package resp
 
 import (
 	"bufio"
@@ -31,34 +31,34 @@ func TestWriteReplies(t *testing.T) {
 	}{
 		{
 			"simple string",
-			func(w *bufio.Writer) error { return writeSimpleString(w, "OK") },
+			func(w *bufio.Writer) error { return WriteSimpleString(w, "OK") },
 			"+OK\r\n",
 		},
 		{
 			"error",
-			func(w *bufio.Writer) error { return writeError(w, "ERR unknown command 'FOO'") },
+			func(w *bufio.Writer) error { return WriteError(w, "ERR unknown command 'FOO'") },
 			"-ERR unknown command 'FOO'\r\n",
 		},
 		{
 			"bulk string",
-			func(w *bufio.Writer) error { return writeBulkString(w, "hossam") },
+			func(w *bufio.Writer) error { return WriteBulkString(w, "hossam") },
 			"$6\r\nhossam\r\n",
 		},
 		{
 			// The length prefix means payload content is never inspected, so
 			// a value containing the delimiter encodes without escaping.
 			"bulk string containing CRLF",
-			func(w *bufio.Writer) error { return writeBulkString(w, "a\r\nb") },
+			func(w *bufio.Writer) error { return WriteBulkString(w, "a\r\nb") },
 			"$4\r\na\r\nb\r\n",
 		},
 		{
 			"empty bulk string",
-			func(w *bufio.Writer) error { return writeBulkString(w, "") },
+			func(w *bufio.Writer) error { return WriteBulkString(w, "") },
 			"$0\r\n\r\n",
 		},
 		{
-			"null bulk string",
-			writeNullBulkString,
+			"null",
+			WriteNull,
 			"$-1\r\n",
 		},
 	}
@@ -77,8 +77,8 @@ func TestWriteReplies(t *testing.T) {
 // up and the answer was empty"; if these two encodings ever collide, a cached
 // empty value becomes indistinguishable from a miss.
 func TestNullIsNotEmptyString(t *testing.T) {
-	null := encode(t, writeNullBulkString)
-	empty := encode(t, func(w *bufio.Writer) error { return writeBulkString(w, "") })
+	null := encode(t, WriteNull)
+	empty := encode(t, func(w *bufio.Writer) error { return WriteBulkString(w, "") })
 
 	if null == empty {
 		t.Fatalf("null and empty string encode identically as %q", null)
@@ -92,8 +92,8 @@ func TestSimpleStringRejectsCRLF(t *testing.T) {
 	for _, s := range []string{"bad\r\nvalue", "trailing\r", "trailing\n"} {
 		var sb strings.Builder
 		w := bufio.NewWriter(&sb)
-		if err := writeSimpleString(w, s); !errors.Is(err, errUnwritableSimple) {
-			t.Errorf("writeSimpleString(%q) error = %v, want errUnwritableSimple", s, err)
+		if err := WriteSimpleString(w, s); !errors.Is(err, errUnwritableSimple) {
+			t.Errorf("WriteSimpleString(%q) error = %v, want errUnwritableSimple", s, err)
 		}
 	}
 }

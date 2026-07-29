@@ -1,4 +1,10 @@
-package main
+// Package store holds the key-value data every client shares.
+//
+// It knows nothing about RESP, connections, or command names. Keeping it
+// ignorant of the protocol is what will let week 3 add persistence and week 2
+// add expiry without either one having to care how a client phrased the
+// request.
+package store
 
 import "sync"
 
@@ -18,7 +24,8 @@ type Store struct {
 	m  map[string]string
 }
 
-func NewStore() *Store {
+// New returns an empty Store ready for concurrent use.
+func New() *Store {
 	return &Store{m: make(map[string]string)}
 }
 
@@ -32,6 +39,7 @@ func (s *Store) Get(key string) (string, bool) {
 	return v, ok
 }
 
+// Set stores value under key, replacing any previous value.
 func (s *Store) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

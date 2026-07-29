@@ -51,4 +51,6 @@ what that choice costs in memory versus CPU.
   24 tests green.
 - **Session 4** — Reply encoding, command dispatch, mutex-guarded store. Week 1
   bar met: real `redis-cli` works unmodified. Flush rule (ADR-005) measured at
-  16x throughput under pipelining versus flushing per command.
+  16x throughput under pipelining versus flushing per command. Then split the
+  flat package into `internal/{resp,store,server}` (ADR-006) and added store
+  and dispatch tests, which the package boundary made straightforward to write.

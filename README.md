@@ -63,6 +63,33 @@ The gap between the first row and the rest is one `if` statement: replies are
 flushed only once the read buffer is drained, so a pipelined burst costs a
 single `write` syscall rather than one per command. See ADR-005.
 
+## Layout
+
+```
+main.go                  flags, listener, wiring — and nothing else
+internal/
+  resp/                  the wire protocol; knows nothing about storage
+    reader.go            ReadCommand + unexported framing helpers
+    writer.go            reply encoding, including null vs empty string
+  store/                 the data; knows nothing about the protocol
+    store.go
+  server/                the only package that imports both
+    server.go            accept loop, connection handling, the flush rule
+    command.go           command dispatch
+```
+
+Dependencies run one way — `server → resp` and `server → store`, with `resp`
+and `store` unaware of each other:
+
+```
+        server
+        ╱     ╲
+     resp     store
+```
+
+That is why the parser can be tested against a `strings.Reader` with no server
+running, and the store against no socket at all. See ADR-006.
+
 ## Design notes
 
 *Architecture walkthrough and tradeoffs to follow as the implementation lands.

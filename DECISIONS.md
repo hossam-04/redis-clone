@@ -102,3 +102,34 @@ buffer.
 to earlier ones. `Buffered() != 0` would suppress the flush while `ReadCommand`
 blocks on the remainder. No real client behaves this way, and the only victim
 is the connection that did it, but it is the known soft spot in this rule.
+
+---
+
+## ADR-006 — Three internal packages, dependencies pointing one way
+
+**Decision:** Split the code into `internal/resp` (wire protocol),
+`internal/store` (data), and `internal/server` (the loop joining them), with
+`main.go` at the repo root.
+
+*Alternatives:* Stay flat in `package main`; or adopt the fuller
+`cmd/<binary>/` convention.
+
+**Why:** The dependency graph is the point. `resp` and `store` import nothing
+of ours and do not know each other exists; `server` is the only package that
+imports both. That is what already makes the parser testable against a
+`strings.Reader` and the store testable without a socket, and it is now
+enforced by the compiler rather than by discipline — `readLine` and
+`readBulkString` are unexported, so protocol internals are genuinely
+unreachable from command handling. As weeks 2–4 add expiry, eviction, and
+persistence, that boundary is what stops the store from growing opinions about
+RESP.
+
+`internal/` on top of that means nothing outside this module can import any of
+it, so there is no accidental public API to keep stable.
+
+`cmd/` was rejected because the nesting only pays for itself when a repo ships
+several binaries. This one ships a single server, and the extra directory would
+change the documented run command in exchange for nothing.
+
+*Would revisit if:* the project grows a second binary — a CLI, or a custom
+benchmark harness — at which point `cmd/` starts earning its keep.

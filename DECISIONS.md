@@ -368,3 +368,96 @@ applied, and compares.
 *Would revisit if:* crashes start producing zero-filled tails rather than short
 ones, which some filesystems do. Those parse as malformed rather than short and
 would currently be treated as unexplained corruption.
+
+---
+
+## ADR-012 — Group commit: one `fsync` serves every client waiting on it
+
+**Decision:** With `appendfsync always`, a client needing durability waits on a
+sequence number rather than issuing its own `fsync`. The first arrival performs
+the sync and everyone queued behind it is released by the same syscall. The
+mutex is released for the sync's duration.
+
+*Alternatives:* `fsync` per client, which is what this replaced. A dedicated
+writer goroutine that owns the file and batches on a timer.
+
+**Why:** this was found by measuring, not by reasoning, which is the reason
+milestone 4 exists. `appendfsync always` was running at **12% of real Redis
+unpipelined and 5% at pipeline depth 16** — not a constant factor, a design
+flaw.
+
+The cause: goroutine-per-connection means fifty clients committing produce fifty
+`fsync` calls. Redis is single-threaded, so its event loop necessarily reads all
+ready clients, appends them to one buffer, and issues **one** `write` and **one**
+`fsync` for the batch. The property that makes this sound is that `fsync`
+flushes the whole file rather than one caller's bytes, so a client may ride on
+another's sync provided its own bytes reached the kernel first.
+
+Sharp irony worth recording: being single-threaded is what makes Redis lose
+every other comparison here, and it is what hands it group commit for free.
+
+The correctness constraint is that a sync only covers bytes the kernel already
+held when it *started*. So `syncThrough` captures its target before syncing, and
+a writer arriving mid-sync waits for the next one. `TestFlushDuringAnFsyncWaits
+ForTheNextOne` pins that down; without it the log would report durability it
+does not have, which is worse than being slow.
+
+Measured, same machine, `-c 50`:
+
+| `appendfsync always` | before | after | Redis | ours/Redis |
+|---|---|---|---|---|
+| SET, no pipelining | 557/s | 4,327/s | 4,926/s | 12% → **88%** |
+| SET, pipeline 16 | 3,855/s | 61,069/s | 70,175/s | 5% → **87%** |
+| p50, no pipelining | 95.9ms | 10.8ms | 9.8ms | |
+
+*Would revisit if:* the same batching is wanted for the `write` as well as the
+`fsync` — see the open finding below, which is the remaining gap against Redis.
+
+---
+
+## ADR-013 — Refuted: holding the mutex across `fsync` was not what hurt p99
+
+**Decision:** Recorded as a refutation. `syncPeriodically` no longer holds the
+log mutex across the sync, and it made no measurable difference. The
+`appendfsync everysec` tail-latency gap has a different cause.
+
+**Why record a failed hypothesis:** the prediction was specific and wrong, and
+the measurement that refuted it also located the real cause. That is worth more
+in the file than a tidy story would be.
+
+The reasoning was: `fsync` costs milliseconds, we held the mutex across it, so
+once a second every client stalls for a disk round trip — invisible in
+throughput at 0.1% of wall time, a cliff at p99. Plausible, and the fix was
+correct on its own terms. The number did not move:
+
+```
+p99, everysec, no pipelining:   2.887ms before  →  2.951ms after
+                                (real Redis: 0.543ms)
+```
+
+A concurrency scan found the actual shape:
+
+| clients | ours p99 | Redis p99 |
+|---|---|---|
+| 1 | 0.055ms | 0.047ms |
+| 4 | 0.127ms | 0.087ms |
+| 16 | 0.623ms | 0.191ms |
+| 50 | 2.799ms | 0.583ms |
+| 200 | 5.335ms | 2.663ms |
+
+**We are identical to Redis at one client and 4.8× worse at fifty.** So the tail
+is not a periodic stall — a once-a-second event would not scale with client
+count. It is contention.
+
+The likely cause is that group commit was applied to the `fsync` but not to the
+`write`: every client still issues its own `write` syscall on the shared log,
+serialised through one mutex and one file. Redis issues one `write` per event
+loop iteration covering all clients. The batching idea generalises, and we
+applied it in only one of the two places it belongs.
+
+Stated as a hypothesis rather than a conclusion, because it has not been
+profiled — which is exactly the mistake this ADR exists to record.
+
+*Would revisit if:* profiling confirms it. The fix would be a dedicated writer
+goroutine owning the file, with clients handing off buffers rather than writing
+themselves.

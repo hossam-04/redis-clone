@@ -6,6 +6,17 @@ code alone does not carry.
 ---
 
 ## Current state
+**Milestone 4 — done.** Benchmarked against real Redis on the same machine, with
+p99 recorded alongside throughput. In memory we run at 88% of Redis unpipelined
+and 112% on pipelined `SET` — we win on throughput there because Redis uses one
+core and we use eight, and lose 2.2x on tail latency for the same reason.
+
+Benchmarking earned its keep by finding a design flaw reasoning had missed:
+`appendfsync always` was at 12% of Redis because fifty clients meant fifty
+`fsync` calls where Redis batches all fifty into one. Group commit (ADR-012)
+took it to 88%. A second prediction was refuted and the refutation is recorded
+in ADR-013 rather than quietly deleted.
+
 **Milestone 3 — done.** Writes are appended to a log of RESP commands and
 replayed on startup. Verified by actually doing it: `kill -9` the server with
 six keys set, restart, all six come back — including an empty-string value, a
@@ -35,14 +46,14 @@ encoder, dispatch, and the mutex-guarded store.
 | 1 | TCP listener, RESP parser, `PING` / `ECHO` / `SET` / `GET`. Bar: `redis-cli` connects. | ☑ |
 | 2 | Concurrent clients, key expiry (`PX` / `EX`), LRU eviction under memory pressure. | ☑ |
 | 3 | Append-only log, replay on startup, survive `kill -9` with no data loss. | ☑ |
-| 4 | Benchmark with `redis-benchmark`, record throughput + p99, write the README. | ☐ |
+| 4 | Benchmark with `redis-benchmark`, record throughput + p99, write the README. | ☑ |
 
 ## Next up
-Milestone 4: benchmark with `redis-benchmark`, record throughput and p99 against
-real Redis on the same machine, and finish the README. Things already known to
-be worth measuring: the `clock.Add(1)` on every read is a single contended cache
-line, and `--appendfsync always` should show the millisecond cost of `fsync`
-directly.
+Milestone 4 is measured and written up; what remains is the open finding from
+ADR-013. Profile the `everysec` tail to confirm it is per-client `write`
+syscalls contending on one mutex and one file, and if so apply group commit to
+the write as well as the `fsync` — a dedicated writer goroutine owning the file,
+with clients handing off buffers instead of writing themselves.
 
 ## Open questions
 - **No log compaction.** The log grows with total writes, not data size, so a
@@ -105,3 +116,8 @@ directly.
   that should have lapsed and enough restarts would make TTL'd keys immortal.
   A torn tail is detected by byte offset rather than error kind, because a
   record cut inside a header line looks exactly like a clean end of file.
+- **Session 8** — Benchmarked against real Redis (ADR-012/013). Built a harness
+  first — median of 3 after a warm-up — so no number is one lucky run. Found
+  and fixed the group-commit flaw: 7.8x unpipelined, 15.8x pipelined. Recorded
+  a refuted hypothesis about the `everysec` tail, and used a concurrency scan
+  to locate the real cause instead of guessing again.

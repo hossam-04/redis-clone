@@ -1,10 +1,14 @@
 package aof
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hossam-04/redis-clone/internal/resp"
 )
@@ -219,5 +223,145 @@ func TestConcurrentAppends(t *testing.T) {
 	got := readLog(t, path)
 	if n := strings.Count(got, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"); n != 800 {
 		t.Errorf("found %d intact commands, want 800 (bytes interleaved?)", n)
+	}
+}
+
+// TestGroupCommitSharesOneFsync is the whole point of syncThrough. Fifty
+// clients committing at once must not cost fifty disk round trips.
+//
+// The fake fsync sleeps, because its duration is what forms the batch: clients
+// arriving while it runs are already waiting when it finishes, so one more
+// covers all of them. An instant fsync would batch nothing and prove nothing.
+func TestGroupCommitSharesOneFsync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.aof")
+	l, err := Open(path, Always)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	var syncs atomic.Int64
+	l.syncFile = func() error {
+		syncs.Add(1)
+		time.Sleep(5 * time.Millisecond) // stands in for a disk round trip
+		return nil
+	}
+
+	const clients = 50
+	var wg sync.WaitGroup
+	for range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := l.Append(resp.Command{"SET", "k", "v"}); err != nil {
+				t.Errorf("Append: %v", err)
+				return
+			}
+			if err := l.Flush(); err != nil {
+				t.Errorf("Flush: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got := syncs.Load()
+	if got < 1 {
+		t.Fatal("no fsync happened; Always must not return before durability")
+	}
+	if got >= clients {
+		t.Errorf("%d fsyncs for %d concurrent commits: they are not being batched", got, clients)
+	}
+	t.Logf("%d clients committed with %d fsyncs", clients, got)
+}
+
+// TestFlushDuringAnFsyncWaitsForTheNextOne is the safety half. An fsync only
+// covers bytes the kernel already had when it started, so a writer that
+// arrives midway must NOT be released by it -- doing so would report
+// durability that does not exist.
+func TestFlushDuringAnFsyncWaitsForTheNextOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.aof")
+	l, err := Open(path, Always)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	var syncs atomic.Int64
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	l.syncFile = func() error {
+		if syncs.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+		}
+		return nil
+	}
+
+	early := make(chan error, 1)
+	go func() {
+		_ = l.Append(resp.Command{"SET", "early", "v"})
+		early <- l.Flush()
+	}()
+	<-firstStarted // the first fsync is now in flight
+
+	late := make(chan error, 1)
+	go func() {
+		_ = l.Append(resp.Command{"SET", "late", "v"})
+		late <- l.Flush()
+	}()
+
+	// Wait until the late writer's bytes have actually reached the kernel,
+	// so we know it arrived during the in-flight fsync rather than after it.
+	for {
+		l.mu.Lock()
+		seq := l.writeSeq
+		l.mu.Unlock()
+		if seq >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	select {
+	case <-late:
+		t.Fatal("the late writer was released by an fsync that started before its write")
+	default:
+	}
+
+	close(releaseFirst)
+	if err := <-early; err != nil {
+		t.Fatalf("early Flush: %v", err)
+	}
+	if err := <-late; err != nil {
+		t.Fatalf("late Flush: %v", err)
+	}
+	if got := syncs.Load(); got < 2 {
+		t.Errorf("%d fsyncs; the late write needed one of its own", got)
+	}
+}
+
+// TestFsyncFailureIsSticky: a failed fsync can mean the kernel has already
+// discarded the data, so later calls must keep reporting the failure rather
+// than implying a subsequent success repaired it.
+func TestFsyncFailureIsSticky(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.aof")
+	l, err := Open(path, Always)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	boom := errors.New("disk on fire")
+	l.syncFile = func() error { return boom }
+
+	_ = l.Append(resp.Command{"SET", "k", "v"})
+	if err := l.Flush(); !errors.Is(err, boom) {
+		t.Fatalf("first Flush = %v, want %v", err, boom)
+	}
+
+	l.syncFile = func() error { return nil } // "disk recovers"
+	_ = l.Append(resp.Command{"SET", "k2", "v"})
+	if err := l.Flush(); !errors.Is(err, boom) {
+		t.Errorf("later Flush = %v, want the original failure to stick", err)
 	}
 }

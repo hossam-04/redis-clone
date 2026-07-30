@@ -57,20 +57,71 @@ go test ./...
 
 ## Benchmarks
 
-Preliminary smoke numbers only — `redis-benchmark -t set,get -n 20000` on an
-M-series Mac, client and server on loopback. **Not yet a real result:** there is
-no comparison against real Redis, no p99, and no persistence in the write path,
-all of which land in Milestone 4.
+Apple M1 Pro, 8 cores, 16 GB · Go 1.26.5 · Redis 8.8.1 · both servers on the
+same machine, `-c 50 -r 10000`, median of 3 runs after a discarded warm-up.
 
-| Pipeline depth | Throughput |
-|----------------|------------|
-| none           | ~90–97k ops/sec |
-| 16             | ~1.5M ops/sec   |
-| 64             | ~2.2–4.0M ops/sec |
+**Caveats first,** because a benchmark without them is marketing. The client and
+both servers share one laptop and compete for the same cores. `redis-benchmark`
+is closed-loop, so it stops sending when the server stalls, which systematically
+*understates* tail latency. Run-to-run variance on an identical configuration is
+around 10%. Real Redis is single-threaded C with its own allocator and no GC —
+the goal here is to understand the gap, not to win.
 
-The gap between the first row and the rest is one `if` statement: replies are
-flushed only once the read buffer is drained, so a pipelined burst costs a
-single `write` syscall rather than one per command. See ADR-005.
+### In memory, no persistence
+
+| | ours | Redis | ours/Redis |
+|---|---|---|---|
+| GET, no pipelining | 95,420/s | 108,225/s | 88% |
+| GET, pipeline 16 | 1,470,588/s | 1,515,152/s | 97% |
+| SET, no pipelining | 95,969/s | 108,460/s | 88% |
+| SET, pipeline 16 | **1,190,476/s** | 1,063,830/s | **112%** |
+
+We beat Redis on pipelined `SET`, and the reason is ADR-001 paying off three
+milestones later: Redis uses one core, our goroutine-per-connection model uses
+eight. Under enough concurrent pipelined load, parallelism beats C.
+
+It is not free. On the same workload:
+
+```
+p99, SET pipeline 16:    ours 2.159ms    Redis 0.967ms
+```
+
+**Higher throughput, 2.2× worse tail.** That trade is why these are measured at
+p99 and not on the average, which would have hidden it entirely.
+
+### Cost of durability (`SET`, no pipelining)
+
+| | ours | Redis |
+|---|---|---|
+| `appendonly` off | 95,602/s | 122,549/s |
+| `appendfsync everysec` | 88,968/s | 122,249/s |
+| `appendfsync always` | 4,327/s | 4,926/s |
+
+`fsync` is a ~10ms round trip on this hardware, and `always` pays it per batch.
+That single row is the entire reason durability is a dial.
+
+### What benchmarking actually found
+
+Two things, and only one of them was the thing we predicted.
+
+**Group commit — a real flaw, found and fixed.** `appendfsync always` first
+measured at **12% of Redis unpipelined and 5% pipelined**. Fifty clients meant
+fifty `fsync` calls, where single-threaded Redis necessarily batches all fifty
+into one. Making clients wait on a shared sync rather than issue their own:
+
+```
+SET, always, no pipelining:     557/s  →   4,327/s     (7.8×)
+SET, always, pipeline 16:     3,855/s  →  61,069/s    (15.8×)
+```
+
+See ADR-012.
+
+**A refuted hypothesis, kept on the record.** We predicted the `everysec` tail
+came from holding the log mutex across `fsync`. The fix was correct on its own
+terms and changed nothing (2.887ms → 2.951ms). A concurrency scan then showed
+the tail is contention, not a periodic stall — identical to Redis at one client,
+4.8× worse at fifty. See ADR-013 for the real diagnosis and why the wrong guess
+is worth writing down.
 
 ### Eviction accuracy
 
